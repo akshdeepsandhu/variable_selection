@@ -1,0 +1,371 @@
+---
+title: "Exploring the stability of variable selection methods"
+author: "Ash Sandhu"
+date: "11/29/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(glmnet)
+library(tableone)
+library(caret)
+library(ROCR)
+library(randomForest)
+library(parallel)
+library(broom)
+library(doParallel)
+```
+
+
+#TODO: 
+
+* Table 1:
+  - Cohort demographics
+  - Missing values and imputations used
+* PreProcessing:
+  - Impute missing values
+  - Centre and scale everything
+  - Model.Matrix
+* Methods:
+  - StepwiseAIC, univariate-selection based on p-values, LASSO, Elastic-net, RF (Var importance rankings)
+*Steps:
+  1. Fit model to the entire dataset with a varying sample size 
+  (n = 500, 1000, 2000, 3000, max ~ 3500)
+  2. Bootstrap entire procedure (1000 times) to get sampling distributions and       frequency of selection
+
+Notes on variables:
+temp + temp^2
+cont: time_since_hosp, distance_new, #sibllings, maternal_education
+Remove: water_source and dataset
+
+
+##Pre-processing
+```{r, echo=FALSE,warning=F,message=F}
+
+#load and reformat data
+df.raw <- read_csv('../data/SD_for_Ash.csv')
+#change type to categorical for relevant variables
+factor.vars <- c("sex","Abnormal_BCS","hivFinal","bednet","final_outcome_death", "boiling", "hivMaternal", "malaria", "sibling_deaths")
+del.vars <- c("water_source_drinking")
+
+#clean up
+df.raw <- df.raw %>% 
+  select(-del.vars) %>% 
+  mutate_at(vars(factor.vars), funs(factor))
+
+df.raw$final_outcome_death <- make.names(df.raw$final_outcome_death)
+  
+table.one <- CreateTableOne(vars = colnames(df.raw), data = df.raw,
+                            factorVars = factor.vars)
+
+
+#centre and scale
+df.scaled <- scale(df.raw %>% select(-c(factor.vars, W_AZ, W_LZ,BMI_AZ)))
+df.full <- cbind(as.data.frame(df.scaled), df.raw %>% select(factor.vars, W_AZ, W_LZ, BMI_AZ))
+df.full <- df.full %>% 
+  mutate(temp2 = temperature*temperature)
+df.matrix <- model.matrix(final_outcome_death ~ . , df.full)
+
+
+
+rm(df.raw)
+```
+
+
+## Model fitting 
+
+##TODO: 
+- fix event rate in each sample (~ 5%) -> no need to do this, randomly sampling  should sort this out 
+- pull out preformance measures
+- add stepwise p-val (not aic)
+- change metrics to ROC not accuracy 
+
+###Part 1: Define functions
+
+```{r, warning=F, message=F}
+
+#model fitting procedure
+do_model_fitting <- function(df.full,df.matrix, rep.val){
+
+#(a): set up matricies for data collection
+
+model.vars <- colnames(df.matrix)[-1]
+n <- c(500,1000,2000,2500,3000,3500,4000)
+method <- c("RF", "stepwiseAIC", "univarate.pval", "LASSO")
+
+#variable selection frequency matrix
+frequency.matrix <- data.frame(matrix(ncol = ncol(df.matrix) + 1, nrow = 0))
+colnames(frequency.matrix) <- c(model.vars,"method", "n")
+
+#helper function to generate samples of size n
+get_sample <- function(df, n){
+  #outputs a list of dataframes, with samples of varying size
+  #method is meant to mimic scenario where data is collected over time so sample size gets larger.
+  #n.vec - vector with samples sizes desired
+    
+  n.vec <- c(n[1],diff(n))
+  list.sample <- list(length(n.vec))
+  sample.df <- data.frame(matrix(ncol = ncol(df), nrow = 0))
+  for(i in 1:length(n.vec)){
+    #get sample and index in original df
+    sample.df <- rbind(sample.df,sample_n(as.data.frame(df),size = n.vec[i]))
+    idx.sample <- plyr::match_df(as.data.frame(df),sample.df) %>% rownames() %>% as.numeric()
+    #remove those rows from the old dataframe
+    df <- df[-idx.sample, ]
+    list.sample[[i]] <- sample.df
+  }
+  
+  return(list.sample)
+}
+
+#(b): model fitting methods
+
+#rf method
+get_rf_results <- function(sample.list, col.names){
+  
+  #Get the top variables chosen by RF for different samples sizes 
+      
+      #helper functions
+      fit.rf <- function(df){
+        #function that will fit a rf and return top 10 most important varibales
+        
+        #create model matrix for fitting
+        df.matrix <- model.matrix(final_outcome_death ~ . , df)
+        #get n and variable names
+        n <- nrow(df); model.vars <- colnames(df.matrix)[-1]
+        #clean up dataframe to allow for model fitting
+        df <- df %>% drop_na()
+        #fit rf
+        x.mat <- df.matrix[,-1]
+        ctrl <- trainControl("cv", 10,classProbs=TRUE, summaryFunction = twoClassSummary )
+        df$final_outcome_death <- make.names(df$final_outcome_death)
+        rf <- train(x = x.mat, y = df$final_outcome_death,
+                    method="rf", metric="ROC", ntree=200,
+                    trControl = ctrl, parallel = T)
+        #get top variables
+        importance <- importance(rf$finalModel)
+        top.vars <- row.names((as.data.frame(sort(t(importance)[1,], decreasing = T)[1:10])))
+        #score variable with 1 if it is in the model and 0 o.w
+        in.model <- as.numeric(model.vars %in% top.vars)
+      
+        
+        return(c(in.model,"RF",n))
+        
+      }
+      
+      #helper to speed up
+      get_rf_vars <- function(sample.df, names.vec){
+        
+        #fit row and get vars chosen
+        out.row <- as.data.frame(t(fit.rf(sample.df)))
+        names(out.row) <- names.vec
+        return(out.row)
+      
+      }
+      
+      #fit in parallel and get the results
+      results <- mclapply(sample.list, get_rf_vars, 
+                          names.vec = col.names,
+                          mc.cores = 1)
+      
+      return(results)
+}
+
+#stepwise
+get_stepwise_results <- function(sample.list, col.names){
+  
+  
+  fit.stepwise <- function(df){
+    
+    #create model matrix for fitting
+    df.matrix <- model.matrix(final_outcome_death ~ . , df)
+    #get n and variable names
+    n <- nrow(df); model.vars <- colnames(df.matrix)[-1]
+    #clean up dataframe to allow for model fitting
+    df <- df %>% drop_na()
+    #fit stepwiseAIC regression to glm object
+    x.mat <- df.matrix[,-1]
+    fit.aic <- train(x = x.mat , y = df$final_outcome_death,
+                     method = "glmStepAIC",family=binomial(),
+                     trControl = trainControl("cv", 10) , trace=F)
+    #get vars
+    top.vars <- variable.names(fit.aic$finalModel)[-1]
+    #score variable with 1 if it is in the model and 0 o.w
+    in.model <- as.numeric(model.vars %in% top.vars)
+
+     return(c(in.model,"stepAIC",n))
+ 
+  }
+
+
+  #helper to speed up
+  get_stepaic_vars <- function(sample.df, names.vec){
+    
+    #fit row and get vars chosen
+    out.row <- as.data.frame(t(fit.stepwise(sample.df)))
+    names(out.row) <- names.vec
+    return(out.row)
+  
+  }
+  
+  
+  #fit in parallel and get the results
+  results <- mclapply(sample.list, get_stepaic_vars,
+                        names.vec = col.names,
+                        mc.cores = 1)
+    
+  return(results)
+
+}
+
+#univariate
+get_univarate_results <- function(sample.list, col.names){
+  
+  
+  fit.univarate <- function(df){
+    
+    #create model matrix for fitting
+    df.matrix <- model.matrix(final_outcome_death ~ . , df)
+    #get n and variable names
+    n <- nrow(df); model.vars <- colnames(df.matrix)[-1]
+    #clean up dataframe to allow for model fitting
+    df <- df %>% drop_na()
+    print(table(df$final_outcome_death))
+    #fit stepwiseAIC regression to glm object
+    x.mat <- df.matrix[,-1]
+    ctrl <- trainControl("cv", 10,classProbs=TRUE, summaryFunction = twoClassSummary )
+    fit.glm <- train(x = x.mat , y = df$final_outcome_death,
+                     method = "glm",family=binomial(),
+                     trControl = ctrl,
+                     metric = 'AUC', trace=F)
+    #get vars
+    coef <- tidy(fit.glm$finalModel)
+    coef <- coef[-1,]
+    top.vars <- coef$term[coef$p.value < 0.05]
+    #score variable with 1 if it is in the model and 0 o.w
+    in.model <- as.numeric(model.vars %in% top.vars)
+
+     return(c(in.model,"univariate.pval",n))
+ 
+  }
+
+
+  #helper to speed up
+  get_univariate_vars <- function(sample.df, names.vec){
+    
+    #fit row and get vars chosen
+    out.row <- as.data.frame(t(fit.univarate(sample.df)))
+    names(out.row) <- names.vec
+    return(out.row)
+  
+  }
+  
+  
+  #fit in parallel and get the results
+  results <- mclapply(sample.list, get_univariate_vars,
+                        names.vec = col.names,
+                        mc.cores = 1)
+    
+  return(results)
+
+}
+
+#univariate
+get_lasso_results <- function(sample.list, col.names){
+  
+  
+  fit.lasso <- function(df){
+    
+    #create model matrix for fitting
+    df.matrix <- model.matrix(final_outcome_death ~ . , df)
+    #get n and variable names
+    n <- nrow(df); model.vars <- colnames(df.matrix)[-1]
+    #clean up dataframe to allow for model fitting
+    df <- df %>% drop_na()
+    #fit stepwiseAIC regression to glm object
+    x.mat <- df.matrix[,-1]
+    #fit lasso
+    registerDoParallel(4)
+    fit.glm <- cv.glmnet(x.mat,df$final_outcome_death, 
+                         alpha = 1,family = "binomial",
+                         lambda = seq(0.001,0.1,by = 0.001),
+                         standardize = F,
+                         type.measure = "auc", 
+                         nfolds = 10, 
+                         intercept = T)
+    #get vars
+    top.vars <- rownames(coef(fit.glm, s = fit.glm$lambda.min))[coef(fit.glm, s =fit.glm$lambda.min)[,1]!= 0]
+    #score variable with 1 if it is in the model and 0 o.w
+    in.model <- as.numeric(model.vars %in% top.vars)
+
+     return(c(in.model,"LASSO",n))
+ 
+  }
+
+
+  #helper to speed up
+  get_lasso_vars <- function(sample.df, names.vec){
+    
+    #fit row and get vars chosen
+    out.row <- as.data.frame(t(fit.lasso(sample.df)))
+    names(out.row) <- names.vec
+    return(out.row)
+  
+  }
+  
+  
+  #fit in parallel and get the results
+  results <- mclapply(sample.list, get_lasso_vars,
+                        names.vec = col.names,
+                        mc.cores = 1)
+    
+  return(results)
+
+}
+
+#(c): fit models to samples
+
+#generate samples
+sample.list <- get_sample((df.full),n)
+
+#get rf results
+rf.results <- get_rf_results(sample.list, colnames(frequency.matrix))
+frequency.matrix <- do.call(rbind,rf.results)
+print("Finished getting RF results")
+#get stepwise results
+stepwise.results <- get_stepwise_results(sample.list, colnames(frequency.matrix))
+stepwise.results <- do.call(rbind,stepwise.results)
+frequency.matrix <- rbind(frequency.matrix,stepwise.results)
+print("Finished getting stepwiseAIC results")
+#get univariate resutls
+univariate.results <- get_univarate_results(sample.list,colnames(frequency.matrix))
+univariate.results <- do.call(rbind,univariate.results)
+frequency.matrix <- rbind(frequency.matrix, univariate.results)
+print("Finished getting univariate filtering results")
+#get LASSO resutls
+lasso.results <- get_lasso_results(sample.list,colnames(frequency.matrix))
+lasso.results <- do.call(rbind,lasso.results)
+frequency.matrix <- rbind(frequency.matrix, lasso.results)
+print("Finished getting LASSO results")
+frequency.matrix$rep_val <- rep.val
+
+return(frequency.matrix)
+}
+
+```
+
+
+###Part 2: Running the porcedure 
+
+```{r}
+out <- list(10)
+for(i in 1:10){
+  out[[i]] <- do_model_fitting(df.full,df.matrix,i)
+}
+
+out <- do.call(rbind,out)
+```
+
+
