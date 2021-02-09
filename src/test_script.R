@@ -9,13 +9,14 @@ library(broom)
 library(tictoc)
 library(lme4)
 library(lmerTest)
-source('Smart Discharge/src/fit_funcs.R')
+source('src/fit_funcs.R')
 cat('Starting...\n')
 
 #BELOW SCRIPT WORKS: 28/03/2020
 ################################
 #process data
 #load and reformat data
+#path  = 'Smart Discharge/data/SD_for_Ash.csv'
 df.raw <- read_csv('Smart Discharge/data/SD_for_Ash.csv')
 #change type to categorical for relevant variables
 factor.vars <- c("sex","Abnormal_BCS","hivFinal","bednet","final_outcome_death", "boiling", "hivMaternal", "malaria", "sibling_deaths")
@@ -112,3 +113,26 @@ cat('Writing results to file\n')
 out <- do.call(rbind,out)
 write.csv(x=as.data.frame(out), file = 'resultst_test_run.csv', row.names = F)
 cat('Done')
+
+
+####New work
+df.matrix <- data.create_matrix(data.clean_data('data/SD_for_Ash.csv'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
